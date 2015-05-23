@@ -39,10 +39,17 @@ enum {
 	}\
 } while (0)
 
-#define WORK_QUEUE_POWER 8
+#define WORK_QUEUE_POWER 16
 #define WORK_QUEUE_SIZE (1 << WORK_QUEUE_POWER)
 #define WORK_QUEUE_MASK (WORK_QUEUE_SIZE - 1)
-#define thread_queue_len(thread)   ((thread)->in - (thread)->out)
+/* 
+ * Just main thread can increase thread->in, we can make it safely.
+ * However,  thread->out may be increased in both main thread and
+ * worker thread during balancing thread load when new threads are added
+ * to our thread pool...
+*/
+#define thread_out_val(thread)      (__sync_val_compare_and_swap(&(thread)->out, 0, 0))
+#define thread_queue_len(thread)   ((thread)->in - thread_out_val(thread))
 #define thread_queue_empty(thread) (thread_queue_len(thread) == 0)
 #define thread_queue_full(thread)  (thread_queue_len(thread) == WORK_QUEUE_SIZE)
 #define queue_offset(val)           ((val) & WORK_QUEUE_MASK)
@@ -76,7 +83,7 @@ struct tpool {
 };
 
 static pthread_t main_tid;
-static volatile sig_atomic_t global_num_thread = 0;
+static volatile int global_num_thread = 0;
 
 static int tpool_queue_empty(tpool_t *tpool)
 {
@@ -103,7 +110,7 @@ static thread_t* least_load_schedule(tpool_t *tpool)
 	int min_num_works_index = 0;
 
 	assert(tpool && tpool->num_threads > 0);
-	/* To avoid race, we adapt th simplest min value algorithm instead of min-heap */
+	/* To avoid race, we adapt the simplest min value algorithm instead of min-heap */
 	for (i = 1; i < tpool->num_threads; i++) {
 		if (thread_queue_len(&tpool->threads[i]) < 
 				thread_queue_len(&tpool->threads[min_num_works_index]))
@@ -130,6 +137,22 @@ static void sig_do_nothing(int signo)
 	return;
 }
 
+static tpool_work_t *get_work_concurrently(thread_t *thread)
+{
+	tpool_work_t *work = NULL;
+	unsigned int tmp;
+
+	do {
+		work = NULL;
+		if (thread_queue_len(thread) <= 0)
+			break;
+		tmp = thread->out;
+		//prefetch work
+		work = &thread->work_queue[queue_offset(tmp)];
+	} while (!__sync_bool_compare_and_swap(&thread->out, tmp, tmp + 1));
+	return work;
+}
+
 static void *tpool_thread(void *arg)
 {
 	thread_t *thread = arg;
@@ -137,7 +160,7 @@ static void *tpool_thread(void *arg)
 	sigset_t zeromask, newmask, oldmask;
 
 	/* SIGUSR1 handler has been set in tpool_init */
-	global_num_thread++;
+	__sync_fetch_and_add(&global_num_thread, 1);
 	pthread_kill(main_tid, SIGUSR1);
 	sigemptyset(&zeromask);
 	sigemptyset(&newmask);
@@ -165,12 +188,13 @@ static void *tpool_thread(void *arg)
 		#endif
 			pthread_exit(NULL);
 		}
-		work = &thread->work_queue[queue_offset(thread->out)];
-		thread->out++;
-		(*(work->routine))(work->arg);
-	#ifdef DEBUG
-		thread->num_works_done++;
-	#endif
+		work = get_work_concurrently(thread);
+		if (work) {
+			(*(work->routine))(work->arg);
+			#ifdef DEBUG
+				thread->num_works_done++;
+			#endif
+		}
 		if (thread_queue_empty(thread))
 			pthread_kill(main_tid, SIGUSR1);
 	}
@@ -240,21 +264,19 @@ void *tpool_init(int num_threads)
 }
 
 static int dispatch_work2thread(tpool_t *tpool, 
-							void(*routine)(void *), void *arg)
+				thread_t *thread, void(*routine)(void *), void *arg)
 {
-	thread_t *thread = NULL;
 	tpool_work_t *work = NULL;
 
-	thread = tpool->schedule_thread(tpool);
 	if (thread_queue_full(thread)) {
 		debug(TPOOL_WARNING, "queue of thread selected is full!!!");
 		return -1;
 	}
 	work = &thread->work_queue[queue_offset(thread->in)];
-	thread->in++;
 	work->routine = routine;
 	work->arg = arg;
 	work->next = NULL;
+	thread->in++;
 	if (thread_queue_len(thread) == 1) {
 		debug(TPOOL_DEBUG, "signal has task");
 		pthread_kill(thread->id, SIGUSR1);
@@ -262,20 +284,105 @@ static int dispatch_work2thread(tpool_t *tpool,
 	return 0;
 }
 
-static int migrate_thread_work(tpool_t *tpool, thread_t *thread)
+/* 
+ * Here, worker threads died with work undone can not change from->out
+ *  and we can read it directly...
+*/
+static int migrate_thread_work(tpool_t *tpool, thread_t *from)
 {
 	unsigned int i;
 	tpool_work_t *work;
+	thread_t *to;
 
-	for (i = thread->out; i < thread->in; i++) {
-		work = &thread->work_queue[queue_offset(i)];
-		if (dispatch_work2thread(tpool, work->routine, work->arg) < 0)
+	for (i = from->out; i < from->in; i++) {
+		work = &from->work_queue[queue_offset(i)];
+		to = tpool->schedule_thread(tpool);
+		if (dispatch_work2thread(tpool, to, work->routine, work->arg) < 0)
 			return -1;
 	}
 #ifdef DEBUG
-	printf("%ld migrate_thread_work: %u\n", thread->id, thread_queue_len(thread));
+	printf("%ld migrate_thread_work: %u\n", from->id, thread_queue_len(from));
 #endif
 	return 0;
+}
+
+static int isnegtive(int val)
+{
+	return val < 0;
+}
+
+static int ispositive(int val)
+{
+	return val > 0;
+}
+
+static int get_first_id(int arr[], int len, int (*fun)(int))
+{
+	int i;
+
+	for (i = 0; i < len; i++)
+		if (fun(arr[i]))
+			return i;
+	return -1;
+}
+
+/*
+ * The load balance algorithm may not work so balanced because worker threads
+ * are consuming work at the same time, which resulting in work count is not 
+ * real-time
+*/
+static void balance_thread_load(tpool_t *tpool)
+{
+	int count[MAX_THREAD_NUM];
+	int i, out, sum = 0, avg;
+	int first_neg_id, first_pos_id, tmp, migrate_num;
+	thread_t *from, *to;
+	tpool_work_t *work;
+
+	for (i = 0; i < tpool->num_threads; i++) {
+		count[i] = thread_queue_len(&tpool->threads[i]);
+		sum += count[i];
+	}
+	avg = sum / tpool->num_threads;
+	if (avg == 0)
+		return;
+	for (i = 0; i < tpool->num_threads; i++)
+		count[i] -= avg;
+	while (1) {
+		first_neg_id = get_first_id(count, tpool->num_threads, isnegtive);
+		first_pos_id = get_first_id(count, tpool->num_threads, ispositive);
+		if (first_neg_id < 0)
+			break;
+		tmp = count[first_neg_id] + count[first_pos_id];
+		if (tmp > 0) {
+			migrate_num = -count[first_neg_id];
+			count[first_neg_id] = 0;
+			count[first_pos_id] = tmp;
+		} else {
+			migrate_num = count[first_pos_id];
+			count[first_pos_id] = 0;
+			count[first_neg_id] = tmp;
+		}
+		from = &tpool->threads[first_pos_id];
+		to = &tpool->threads[first_neg_id];
+		for (i = 0; i < migrate_num; i++) {
+			work = get_work_concurrently(from);
+			if (work) {
+				dispatch_work2thread(tpool, to, work->routine, work->arg);
+			}
+		}
+	}
+	from = &tpool->threads[first_pos_id];
+	/* Just migrate count[first_pos_id] - 1 works to other threads*/
+	for (i = 1; i < count[first_pos_id]; i++) {
+		to = &tpool->threads[i - 1];
+		if (to == from)
+			continue;
+		work = get_work_concurrently(from);
+		if (work) {
+			dispatch_work2thread(tpool, to, work->routine, work->arg);
+		}
+	}
 }
 
 int tpool_inc_threads(void *pool, int num_inc)
@@ -293,8 +400,8 @@ int tpool_inc_threads(void *pool, int num_inc)
 		spawn_new_thread(tpool, i);
 	if (wait_for_thread_registration(num_threads) < 0)
 		pthread_exit(NULL);
-	/* we can not balance now, however, we can change schedule algorithm */
 	tpool->num_threads = num_threads;
+	balance_thread_load(tpool);
 	return 0;
 }
 
@@ -325,9 +432,11 @@ void tpool_dec_threads(void *pool, int num_dec)
 int tpool_add_work(void *pool, void(*routine)(void *), void *arg)
 {
 	tpool_t *tpool = pool;
+	thread_t *thread;
 
 	assert(tpool);
-	return dispatch_work2thread(tpool, routine, arg);
+	thread = tpool->schedule_thread(tpool);
+	return dispatch_work2thread(tpool, thread, routine, arg);
 }
 
 void tpool_destroy(void *pool, int finish)

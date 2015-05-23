@@ -102,7 +102,7 @@ static enum test_return test_inc_thread(void) {
 	if (tpool == NULL)
 		return TEST_FAIL;
 	
-	for(i = 0; i < WORK_NUM; i++) {
+	for(i = 0; i < WORK_NUM << 13; i++) {
 		if (tpool_add_work(tpool, light_work, NULL) < 0) {
 			tpool_destroy(tpool, 0);
 			return TEST_FAIL;
@@ -110,12 +110,6 @@ static enum test_return test_inc_thread(void) {
 	}
 	if (tpool_inc_threads(tpool, 5) < 0)
 		return TEST_FAIL;
-	for(i = 0; i < WORK_NUM; i++) {
-		if (tpool_add_work(tpool, light_work, NULL) < 0) {
-			tpool_destroy(tpool, 0);
-			return TEST_FAIL;
-		}
-	}
 	tpool_destroy(tpool, 1);
 	return TEST_PASS;
 }
