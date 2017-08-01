@@ -25,6 +25,7 @@
 enum {
 	TPOOL_ERROR,
 	TPOOL_WARNING,
+	TPOOL_INFO,
 	TPOOL_DEBUG
 };
 
@@ -157,25 +158,34 @@ static void *tpool_thread(void *arg)
 {
 	thread_t *thread = arg;
 	tpool_work_t *work = NULL;
-	sigset_t zeromask, newmask, oldmask;
-
+	sigset_t signal_mask, oldmask;
+	int rc;
+	
 	/* SIGUSR1 handler has been set in tpool_init */
 	__sync_fetch_and_add(&global_num_thread, 1);
 	pthread_kill(main_tid, SIGUSR1);
-	sigemptyset(&zeromask);
-	sigemptyset(&newmask);
-	sigaddset(&newmask, SIGUSR1);
+
+	sigemptyset (&oldmask);
+	sigemptyset (&signal_mask);
+	sigaddset (&signal_mask, SIGUSR1);
 
 	while (1) {
-		if (sigprocmask(SIG_BLOCK, &newmask, &oldmask) < 0) {
+		rc = pthread_sigmask(SIG_BLOCK, &signal_mask, NULL);
+		if (rc != 0) {
 			debug(TPOOL_ERROR, "SIG_BLOCK failed");
 			pthread_exit(NULL);
 		}
 		while (thread_queue_empty(thread) && !thread->shutdown) {
 			debug(TPOOL_DEBUG, "I'm sleep");
-			sigsuspend(&zeromask);
+			rc = sigwait (&signal_mask, NULL);
+			if (rc != 0) {
+				debug(TPOOL_ERROR, "sigwait failed");
+				pthread_exit(NULL);
+			}
 		}
-		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0) {
+	
+		rc = pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+		if (rc != 0) {
 			debug(TPOOL_ERROR, "SIG_SETMASK failed");
 			pthread_exit(NULL);
 		}
@@ -184,7 +194,7 @@ static void *tpool_thread(void *arg)
 		if (thread->shutdown) {
 			debug(TPOOL_DEBUG, "exit");
 		#ifdef DEBUG
-			printf("%ld: %d\n", thread->id, thread->num_works_done);
+			debug(TPOOL_INFO, "%ld: %d\n", thread->id, thread->num_works_done);
 		#endif
 			pthread_exit(NULL);
 		}
@@ -212,18 +222,27 @@ static void spawn_new_thread(tpool_t *tpool, int index)
 
 static int wait_for_thread_registration(int num_expected)
 {
-	sigset_t zeromask, newmask, oldmask;
-
-	sigemptyset(&zeromask);
-	sigemptyset(&newmask);
-	sigaddset(&newmask, SIGUSR1);
-	if (sigprocmask(SIG_BLOCK, &newmask, &oldmask) < 0) {
-		debug(TPOOL_ERROR, "SIG_BLOCK failed");
-		return -1;
+	sigset_t signal_mask, oldmask;
+	int rc;
+	
+	sigemptyset (&oldmask);
+	sigemptyset (&signal_mask);
+    sigaddset (&signal_mask, SIGUSR1);
+    rc = pthread_sigmask(SIG_BLOCK, &signal_mask, NULL);
+    if (rc != 0) {
+        debug(TPOOL_ERROR, "SIG_BLOCK failed");
+        return -1;
+    }
+	
+	while (global_num_thread < num_expected) {
+		rc = sigwait (&signal_mask, NULL);
+		if (rc != 0) {
+			debug(TPOOL_ERROR, "sigwait failed");
+			return -1;
+		}
 	}
-	while (global_num_thread < num_expected)
-		sigsuspend(&zeromask);
-	if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0) {
+	rc = pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+    if (rc != 0) {
 		debug(TPOOL_ERROR, "SIG_SETMASK failed");
 		return -1;
 	}
@@ -235,9 +254,9 @@ void *tpool_init(int num_threads)
 	int i;
 	tpool_t *tpool;
 
-	if (num_threads <= 0)
+	if (num_threads <= 0) {
 		return NULL;
-	else if (num_threads > MAX_THREAD_NUM) {
+	} else if (num_threads > MAX_THREAD_NUM) {
 		debug(TPOOL_ERROR, "too many threads!!!");
 		return NULL;
 	}
@@ -396,10 +415,12 @@ int tpool_inc_threads(void *pool, int num_inc)
 		debug(TPOOL_ERROR, "add too many threads!!!");
 		return -1;
 	}
-	for (i = tpool->num_threads; i < num_threads; i++)
+	for (i = tpool->num_threads; i < num_threads; i++) {
 		spawn_new_thread(tpool, i);
-	if (wait_for_thread_registration(num_threads) < 0)
+	}
+	if (wait_for_thread_registration(num_threads) < 0) {
 		pthread_exit(NULL);
+	}
 	tpool->num_threads = num_threads;
 	balance_thread_load(tpool);
 	return 0;
@@ -411,8 +432,9 @@ void tpool_dec_threads(void *pool, int num_dec)
 	int i, num_threads;
 
 	assert(tpool && num_dec > 0);
-	if (num_dec > tpool->num_threads)
+	if (num_dec > tpool->num_threads) {
 		num_dec = tpool->num_threads;
+	}
 	num_threads = tpool->num_threads;
 	tpool->num_threads -= num_dec;
 	for (i = tpool->num_threads; i < num_threads; i++) {
@@ -437,7 +459,8 @@ int tpool_add_work(void *pool, void(*routine)(void *), void *arg)
 	assert(tpool);
 	thread = tpool->schedule_thread(tpool);
 	return dispatch_work2thread(tpool, thread, routine, arg);
-}
+}
+
 
 void tpool_destroy(void *pool, int finish)
 {
@@ -446,20 +469,30 @@ void tpool_destroy(void *pool, int finish)
 
 	assert(tpool);
 	if (finish == 1) {
-		sigset_t zeromask, newmask, oldmask;
+		sigset_t signal_mask, oldmask;
+		int rc;
 
 		debug(TPOOL_DEBUG, "wait all work done");
-		/* SIGUSR1 handler has been set */
-		sigemptyset(&zeromask);
-		sigemptyset(&newmask);
-		sigaddset(&newmask, SIGUSR1);
-		if (sigprocmask(SIG_BLOCK, &newmask, &oldmask) < 0) {
+
+		sigemptyset (&oldmask);
+		sigemptyset (&signal_mask);
+		sigaddset (&signal_mask, SIGUSR1);
+		rc = pthread_sigmask(SIG_BLOCK, &signal_mask, NULL);
+		if (rc != 0) {
 			debug(TPOOL_ERROR, "SIG_BLOCK failed");
 			pthread_exit(NULL);
 		}
-		while (!tpool_queue_empty(tpool))
-			sigsuspend(&zeromask);
-		if (sigprocmask(SIG_SETMASK, &oldmask, NULL) < 0) {
+
+		while (!tpool_queue_empty(tpool)) {
+			rc = sigwait (&signal_mask, NULL);
+			if (rc != 0) {
+				debug(TPOOL_ERROR, "sigwait failed");
+				pthread_exit(NULL);
+			}
+		}
+		
+		rc = pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+		if (rc != 0) {
 			debug(TPOOL_ERROR, "SIG_SETMASK failed");
 			pthread_exit(NULL);
 		}
@@ -471,7 +504,8 @@ void tpool_destroy(void *pool, int finish)
 		pthread_kill(tpool->threads[i].id, SIGUSR1);
 	}
 	debug(TPOOL_DEBUG, "wait worker thread exit");
-	for (i = 0; i < tpool->num_threads; i++)
+	for (i = 0; i < tpool->num_threads; i++) {
 		pthread_join(tpool->threads[i].id, NULL);
+	}
 	free(tpool);
 }

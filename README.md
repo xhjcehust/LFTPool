@@ -7,7 +7,7 @@ $ make
 Then you will get an executable file named testtpool.
 
 For more informations, see http://blog.csdn.net/xhjcehust/article/details/45844901.
-#contact
+# contact
 For any question, just contact me at any time.
 
 mailto: hjxiaohust@gmail.com
