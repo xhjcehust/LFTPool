@@ -182,6 +182,7 @@ int main()
 	enum test_return ret;
 	unsigned long timeuse;
 
+	printf("It may take you a few minutes to finish this test, please wait...\n");
 	for (i = 0; testcases[i].description != NULL; ++i) {
 		gettimeofday(&tstart,NULL); 
 		ret = testcases[i].function();
