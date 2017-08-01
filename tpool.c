@@ -159,7 +159,7 @@ static void *tpool_thread(void *arg)
 	thread_t *thread = arg;
 	tpool_work_t *work = NULL;
 	sigset_t signal_mask, oldmask;
-	int rc;
+	int rc, sig_caught;
 	
 	/* SIGUSR1 handler has been set in tpool_init */
 	__sync_fetch_and_add(&global_num_thread, 1);
@@ -177,7 +177,7 @@ static void *tpool_thread(void *arg)
 		}
 		while (thread_queue_empty(thread) && !thread->shutdown) {
 			debug(TPOOL_DEBUG, "I'm sleep");
-			rc = sigwait (&signal_mask, NULL);
+			rc = sigwait (&signal_mask, &sig_caught);
 			if (rc != 0) {
 				debug(TPOOL_ERROR, "sigwait failed");
 				pthread_exit(NULL);
@@ -223,7 +223,7 @@ static void spawn_new_thread(tpool_t *tpool, int index)
 static int wait_for_thread_registration(int num_expected)
 {
 	sigset_t signal_mask, oldmask;
-	int rc;
+	int rc, sig_caught;
 	
 	sigemptyset (&oldmask);
 	sigemptyset (&signal_mask);
@@ -235,7 +235,7 @@ static int wait_for_thread_registration(int num_expected)
     }
 	
 	while (global_num_thread < num_expected) {
-		rc = sigwait (&signal_mask, NULL);
+		rc = sigwait (&signal_mask, &sig_caught);
 		if (rc != 0) {
 			debug(TPOOL_ERROR, "sigwait failed");
 			return -1;
@@ -470,7 +470,7 @@ void tpool_destroy(void *pool, int finish)
 	assert(tpool);
 	if (finish == 1) {
 		sigset_t signal_mask, oldmask;
-		int rc;
+		int rc, sig_caught;
 
 		debug(TPOOL_DEBUG, "wait all work done");
 
@@ -484,7 +484,7 @@ void tpool_destroy(void *pool, int finish)
 		}
 
 		while (!tpool_queue_empty(tpool)) {
-			rc = sigwait (&signal_mask, NULL);
+			rc = sigwait(&signal_mask, &sig_caught);
 			if (rc != 0) {
 				debug(TPOOL_ERROR, "sigwait failed");
 				pthread_exit(NULL);
