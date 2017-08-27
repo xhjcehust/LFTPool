@@ -2,3 +2,4 @@ testtpool*
 debug-testtpool*
 LTFPool.udb
 *.o
+*.orig
