@@ -10,6 +10,6 @@ For more informations, see http://blog.csdn.net/xhjcehust/article/details/458449
 # contact
 For any question, just contact me at any time.
 
-mailto: hjxiaohust@gmail.com
+mailto: xhjcehust@qq.com
 
 Any suggestion is welcome!
