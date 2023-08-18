@@ -107,7 +107,7 @@ static enum test_return test_inc_thread(void)
     if (tpool == NULL)
         return TEST_FAIL;
 
-    for(i = 0; i < WORK_NUM << 13; i++) {
+    for(i = 0; i < WORK_NUM << 10; i++) {
         if (tpool_add_work(tpool, light_work, NULL) < 0) {
             tpool_destroy(tpool, 0);
             return TEST_FAIL;

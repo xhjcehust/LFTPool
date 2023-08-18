@@ -169,12 +169,13 @@ static void *tpool_thread(void *arg)
     sigemptyset (&signal_mask);
     sigaddset (&signal_mask, SIGUSR1);
 
+    rc = pthread_sigmask(SIG_BLOCK, &signal_mask, NULL);
+    if (rc != 0) {
+        debug(TPOOL_ERROR, "SIG_BLOCK failed");
+        pthread_exit(NULL);
+    }
+
     while (1) {
-        rc = pthread_sigmask(SIG_BLOCK, &signal_mask, NULL);
-        if (rc != 0) {
-            debug(TPOOL_ERROR, "SIG_BLOCK failed");
-            pthread_exit(NULL);
-        }
         while (thread_queue_empty(thread) && !thread->shutdown) {
             debug(TPOOL_DEBUG, "I'm sleep");
             rc = sigwait (&signal_mask, &sig_caught);
@@ -184,11 +185,6 @@ static void *tpool_thread(void *arg)
             }
         }
 
-        rc = pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
-        if (rc != 0) {
-            debug(TPOOL_ERROR, "SIG_SETMASK failed");
-            pthread_exit(NULL);
-        }
         debug(TPOOL_DEBUG, "I'm awake");
 
         if (thread->shutdown) {
